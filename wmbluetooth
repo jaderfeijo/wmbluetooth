@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""wmbluetooth - a Window Maker dockapp that shows your connected Bluetooth devices.
+
+Shows each connected device with its battery level (when the device reports one).
+Mouse:  left click = connect / disconnect menu (rofi)   middle click = Bluetooth power on/off
+Run with --render FILE.png to draw the current state to a PNG without opening any window.
+"""
+import argparse
+import ctypes
+import json
+import select
+import signal
+import subprocess
+import sys
+import threading
+import os
+import time
+
+import cairo
+
+SIZE = 64
+POLL_SECONDS = 3.0
+MAX_LINES = 3
+DEBUG = bool(os.environ.get("WMBT_DEBUG"))
+NAME_CHARS = 10
+
+# ------------------------------------------------------------- Bluetooth state
+
+ADAPTER, DEVICE, BATTERY = "org.bluez.Adapter1", "org.bluez.Device1", "org.bluez.Battery1"
+
+
+def mac_from_path(path):
+    """/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF -> AA:BB:CC:DD:EE:FF"""
+    return path.rsplit("dev_", 1)[-1].replace("_", ":")
+
+
+def parse_objects(objects):
+    """Turn BlueZ's GetManagedObjects() result into the widget's state dict."""
+    powered, found_adapter, devices = False, False, []
+    for path, interfaces in objects.items():
+        if ADAPTER in interfaces:
+            found_adapter = True
+            powered = powered or bool(interfaces[ADAPTER].get("Powered", False))
+        if DEVICE in interfaces:
+            dev = interfaces[DEVICE]
+            if not dev.get("Paired", False) and not dev.get("Connected", False):
+                continue
+            battery = interfaces.get(BATTERY, {}).get("Percentage")
+            devices.append({"path": path, "mac": mac_from_path(path),
+                            "name": dev.get("Alias") or dev.get("Name") or mac_from_path(path),
+                            "connected": bool(dev.get("Connected", False)),
+                            "battery": int(battery) if battery is not None else None})
+    devices.sort(key=lambda d: (not d["connected"], d["name"].lower()))
+    return {"available": found_adapter, "powered": powered, "devices": devices}
+
+
+def read_state():
+    try:
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        reply = bus.call_sync("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+                              None, GLib.VariantType("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NONE, 2000, None)
+        return parse_objects(reply.unpack()[0])
+    except Exception:
+        return {"available": False, "powered": False, "devices": []}
+
+
+def short_name(name):
+    name = name.strip()
+    return name if len(name) <= NAME_CHARS else name[:NAME_CHARS].rstrip()
+
+
+def fit_name(cr, name, width, size=9):
+    """Longest prefix of `name` (at most NAME_CHARS characters) that fits in `width` pixels."""
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(size)
+    text = short_name(name)
+    while len(text) > 1 and cr.text_extents(text).x_advance > width:
+        text = text[:-1].rstrip()
+    return text
+
+
+def bluetoothctl(*args):
+    try:
+        subprocess.run(["bluetoothctl", *args], capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def toggle_power():
+    """Flip the adapter's power, judging by its state right now (not the last poll)."""
+    bluetoothctl("power", "off" if read_state()["powered"] else "on")
+
+
+def device_menu(state):
+    """rofi list of paired devices; picking one connects or disconnects it. Runs in a thread."""
+    devices = state["devices"]
+    if not devices:
+        return
+    labels = []
+    for d in devices:
+        extra = ", ".join(x for x in ("connected" if d["connected"] else "",
+                                      f"{d['battery']}%" if d["battery"] is not None else "") if x)
+        labels.append(("\u25cf " if d["connected"] else "\u25cb ") + d["name"] + (f"  ({extra})" if extra else ""))
+    try:
+        picked = subprocess.run(["rofi", "-dmenu", "-i", "-p", "bluetooth", "-format", "i"],
+                                input="\n".join(labels), capture_output=True, text=True, timeout=120).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if picked.isdigit() and int(picked) < len(devices):
+        d = devices[int(picked)]
+        bluetoothctl("disconnect" if d["connected"] else "connect", d["mac"])
+
+
+# -------------------------------------------------------------------- drawing
+
+BG = (0.07, 0.09, 0.09)
+GREEN = (0.55, 0.85, 0.35)
+BLUE = (0.35, 0.65, 0.95)
+DIM = (0.28, 0.38, 0.38)
+RED = (0.95, 0.30, 0.25)
+AMBER = (0.95, 0.75, 0.20)
+GREY = (0.45, 0.45, 0.45)
+
+
+def _text(cr, x, y, text, size, color, bold=True, align="left"):
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(size)
+    ext = cr.text_extents(text)
+    if align == "center":
+        x = x - ext.width / 2 - ext.x_bearing
+    elif align == "right":
+        x = x - ext.width - ext.x_bearing
+    cr.set_source_rgb(*color)
+    cr.move_to(x, y)
+    cr.show_text(text)
+    return ext
+
+
+def battery_color(percent):
+    return GREEN if percent >= 40 else AMBER if percent >= 20 else RED
+
+
+def render(state):
+    """Draw the widget for `state` and return a 64x64 cairo ImageSurface."""
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, SIZE, SIZE)
+    cr = cairo.Context(surface)
+    cr.set_antialias(cairo.ANTIALIAS_GRAY)
+
+    cr.set_source_rgb(*BG)
+    cr.paint()
+    cr.set_line_width(1)
+    cr.set_source_rgb(0.35, 0.40, 0.40)
+    cr.move_to(0.5, SIZE - 0.5); cr.line_to(0.5, 0.5); cr.line_to(SIZE - 0.5, 0.5); cr.stroke()
+    cr.set_source_rgb(0.02, 0.03, 0.03)
+    cr.move_to(SIZE - 0.5, 0.5); cr.line_to(SIZE - 0.5, SIZE - 0.5); cr.line_to(0.5, SIZE - 0.5); cr.stroke()
+
+    _text(cr, 6, 14, "BT", 9, BLUE)
+
+    if not state["available"]:
+        _text(cr, SIZE / 2, 38, "--", 20, GREY, align="center")
+        _text(cr, SIZE / 2, 56, "no bluez", 8, GREY, bold=False, align="center")
+        return surface
+
+    connected = [d for d in state["devices"] if d["connected"]]
+    dot = RED if not state["powered"] else GREEN if connected else DIM
+    cr.set_source_rgb(*dot)
+    cr.arc(SIZE - 9, 10, 3, 0, 6.2832); cr.fill()
+
+    if not state["powered"]:
+        _text(cr, SIZE / 2, 42, "off", 16, RED, align="center")
+        return surface
+    if not connected:
+        _text(cr, SIZE / 2, 40, "none", 14, DIM, align="center")
+        paired = len(state["devices"])
+        _text(cr, SIZE / 2, 56, f"{paired} paired", 8, DIM, bold=False, align="center")
+        return surface
+
+    shown = connected[:MAX_LINES] if len(connected) <= MAX_LINES else connected[:MAX_LINES - 1]
+    y = 29
+    for d in shown:
+        room = SIZE - 11                          # drawable width between the two 6px/5px margins
+        if d["battery"] is not None:
+            batt = _text(cr, SIZE - 5, y, str(d["battery"]), 8, battery_color(d["battery"]), align="right")
+            room -= batt.width + 4
+        _text(cr, 6, y, fit_name(cr, d["name"], room), 9, GREEN)
+        y += 13
+    if len(connected) > MAX_LINES:
+        _text(cr, 6, y, f"+{len(connected) - (MAX_LINES - 1)} more", 8, DIM, bold=False)
+    return surface
+
+
+# ----------------------------------------------------------------------- Xlib
+# A dockapp is a "withdrawn" window: a leader window plus a 64x64 icon window that
+# Window Maker adopts into the Dock (or shows as a loose icon until you drag it there).
+
+class XWMHints(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_long), ("input", ctypes.c_int), ("initial_state", ctypes.c_int),
+                ("icon_pixmap", ctypes.c_ulong), ("icon_window", ctypes.c_ulong),
+                ("icon_x", ctypes.c_int), ("icon_y", ctypes.c_int),
+                ("icon_mask", ctypes.c_ulong), ("window_group", ctypes.c_ulong)]
+
+
+class XClassHint(ctypes.Structure):
+    _fields_ = [("res_name", ctypes.c_char_p), ("res_class", ctypes.c_char_p)]
+
+
+class XButtonEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+                ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong), ("x", ctypes.c_int),
+                ("y", ctypes.c_int), ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+                ("state", ctypes.c_uint), ("button", ctypes.c_uint), ("same_screen", ctypes.c_int)]
+
+
+class XImage(ctypes.Structure):
+    pass
+
+
+EXPOSE, BUTTON_PRESS, DESTROY_NOTIFY, CLIENT_MESSAGE = 12, 4, 17, 33
+EXPOSURE_MASK, BUTTON_PRESS_MASK = 1 << 15, 1 << 2
+Z_PIXMAP = 2
+STATE_HINT, ICON_WINDOW_HINT, WINDOW_GROUP_HINT, WITHDRAWN = 2, 8, 64, 0
+
+
+class Dockapp:
+    def __init__(self, name):
+        self.x = ctypes.CDLL("libX11.so.6")
+        x = self.x
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XCreateSimpleWindow.restype = ctypes.c_ulong
+        x.XDefaultVisual.restype = ctypes.c_void_p
+        x.XCreateGC.restype = ctypes.c_void_p
+        x.XCreateImage.restype = ctypes.POINTER(XImage)
+        self.dpy = ctypes.c_void_p(x.XOpenDisplay(None))
+        if not self.dpy:
+            sys.exit("wmbluetooth: cannot open the X display")
+        screen = x.XDefaultScreen(self.dpy)
+        root = x.XRootWindow(self.dpy, screen)
+        black = x.XBlackPixel(self.dpy, screen)
+        self.depth = x.XDefaultDepth(self.dpy, screen)
+        self.visual = ctypes.c_void_p(x.XDefaultVisual(self.dpy, screen))
+        leader = x.XCreateSimpleWindow(self.dpy, root, 0, 0, 1, 1, 0, black, black)
+        self.icon = x.XCreateSimpleWindow(self.dpy, root, 0, 0, SIZE, SIZE, 0, black, black)
+        x.XSelectInput(self.dpy, self.icon, EXPOSURE_MASK | BUTTON_PRESS_MASK)
+        hint = XClassHint(name.encode(), b"DockApp")
+        x.XSetClassHint(self.dpy, leader, ctypes.byref(hint))
+        x.XStoreName(self.dpy, leader, name.encode())
+        wm = XWMHints(STATE_HINT | ICON_WINDOW_HINT | WINDOW_GROUP_HINT, 0, WITHDRAWN, 0, self.icon, 0, 0, 0, leader)
+        x.XSetWMHints(self.dpy, leader, ctypes.byref(wm))
+        x.XMapWindow(self.dpy, leader)
+        self.gc = ctypes.c_void_p(x.XCreateGC(self.dpy, self.icon, 0, None))
+        x.XFlush(self.dpy)
+        self._buffer = None
+
+    def draw(self, surface):
+        surface.flush()
+        self._buffer = ctypes.create_string_buffer(bytes(surface.get_data()), SIZE * SIZE * 4)
+        image = self.x.XCreateImage(self.dpy, self.visual, self.depth, Z_PIXMAP, 0, self._buffer,
+                                    SIZE, SIZE, 32, SIZE * 4)
+        self.x.XPutImage(self.dpy, self.icon, self.gc, image, 0, 0, 0, 0, SIZE, SIZE)
+        self.x.XFlush(self.dpy)
+        image.contents  # keep the XImage alive until the put has been flushed
+
+    def fileno(self):
+        return self.x.XConnectionNumber(self.dpy)
+
+    def events(self):
+        """Yield ('expose',) / ('button', n) for every pending event."""
+        event = (ctypes.c_long * 24)()
+        while self.x.XPending(self.dpy):
+            self.x.XNextEvent(self.dpy, event)
+            kind = ctypes.cast(event, ctypes.POINTER(ctypes.c_int))[0]
+            if kind == EXPOSE:
+                yield ("expose",)
+            elif kind == BUTTON_PRESS:
+                yield ("button", ctypes.cast(event, ctypes.POINTER(XButtonEvent)).contents.button)
+            elif kind in (DESTROY_NOTIFY, CLIENT_MESSAGE):
+                yield ("quit",)
+
+
+# ----------------------------------------------------------------------- main
+
+def run():
+    app = Dockapp("wmbluetooth")
+    state = read_state()
+    app.draw(render(state))
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    menu_open = threading.Event()
+
+    def open_menu(snapshot):
+        try:
+            device_menu(snapshot)
+        finally:
+            menu_open.clear()
+
+    fast_until = 0.0
+    next_poll = time.monotonic() + POLL_SECONDS
+    while running:
+        select.select([app.fileno()], [], [], max(0.05, next_poll - time.monotonic()))
+        force = False
+        for event in app.events():
+            if DEBUG:
+                print("event", event, "powered" if state["powered"] else "off", file=sys.stderr, flush=True)
+            if event[0] == "quit":
+                running = False
+            elif event[0] == "expose":
+                force = True
+            elif event[0] == "button":
+                if event[1] == 1 and not menu_open.is_set():
+                    menu_open.set()
+                    threading.Thread(target=open_menu, args=(state,), daemon=True).start()
+                elif event[1] == 2:
+                    threading.Thread(target=toggle_power, daemon=True).start()
+                    fast_until = time.monotonic() + 8.0      # poll quickly while the change lands
+        if force or time.monotonic() >= next_poll:
+            new = read_state()
+            if new != state or force:
+                state = new
+                app.draw(render(state))
+            next_poll = time.monotonic() + (0.5 if time.monotonic() < fast_until else POLL_SECONDS)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Window Maker dockapp showing connected Bluetooth devices")
+    parser.add_argument("--render", metavar="FILE.png", help="draw the current state to a PNG and exit")
+    parser.add_argument("--fake", metavar="JSON",
+                        help='with --render: draw a made-up state, e.g. \'{"powered":true,"devices":'
+                             '[{"name":"AirPods","connected":true,"battery":80}]}\'')
+    args = parser.parse_args(argv)
+    if args.render:
+        if args.fake:
+            fake = json.loads(args.fake)
+            devices = [{"path": "", "mac": "", "battery": None, **d} for d in fake.get("devices", [])]
+            state = {"available": fake.get("available", True), "powered": fake.get("powered", True),
+                     "devices": devices}
+        else:
+            state = read_state()
+        render(state).write_to_png(args.render)
+        return 0
+    run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
