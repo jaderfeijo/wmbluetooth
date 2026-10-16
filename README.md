@@ -2,15 +2,17 @@
 
 A tiny [Window Maker](https://www.windowmaker.org/) dockapp that shows your **connected Bluetooth devices**
 and their battery levels. There was no Bluetooth dockapp in Debian, so this one talks to BlueZ directly over
-D-Bus.
+D-Bus. It is styled after the stock dark dockapps (`wmbattery`, `wmgtemp`): dark panel, teal seven-segment
+digits with faint unlit segments.
 
 ![preview](docs/preview.png)
 
-* Each connected device is listed with its battery percentage (green, amber below 40%, red below 20%) when the
+* A seven-segment digit in the corner counts the connected devices.
+* Each connected device is listed with its battery percentage (teal, white below 40%, red below 20%) when the
   device reports one.
-* Up to three lines are shown; with more devices the last line reads `+N more`.
-* The dot in the corner is green when something is connected, grey when nothing is, and red when Bluetooth is
-  switched off. With nothing connected it shows how many devices are paired.
+* Up to three lines are shown; with more devices the last line reads `+N MORE`.
+* The dot next to the digit is teal when something is connected, dim when nothing is, and red when Bluetooth is
+  switched off (the panel then reads `OFF`). With nothing connected it shows how many devices are paired.
 
 ## Mouse
 
@@ -49,7 +51,8 @@ WMBT_DEBUG=1 wmbluetooth                             # log the events the widget
 ## How it works
 
 A dockapp is a "withdrawn" X window: a 1x1 leader window carrying `WM_HINTS` (initial state *Withdrawn*, icon
-window = a 64x64 window) and the class `DockApp`. Window Maker adopts the 64x64 icon window into the Dock.
+window = a 58x58 window) and the class `DockApp`. Window Maker adopts the icon window into the Dock and draws
+its own 64x64 tile around it, like it does for the stock dockapps.
 The program talks to Xlib through `ctypes`, draws with Cairo, and polls BlueZ's `GetManagedObjects()` every
 three seconds (every half second for a few seconds after you switch power, so the change shows quickly).
 

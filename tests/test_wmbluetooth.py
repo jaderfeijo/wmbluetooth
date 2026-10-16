@@ -67,7 +67,7 @@ class ParseTests(unittest.TestCase):
 class RenderTests(unittest.TestCase):
     def test_size(self):
         surface = wm.render(state([]))
-        self.assertEqual((surface.get_width(), surface.get_height()), (64, 64))
+        self.assertEqual((surface.get_width(), surface.get_height()), (58, 58))
 
     def test_states_look_different(self):
         shots = {
@@ -81,6 +81,20 @@ class RenderTests(unittest.TestCase):
 
     def test_many_devices_do_not_crash(self):
         wm.render(state([device(f"Device number {i}", True, i * 10) for i in range(9)]))
+
+    def test_connected_count_is_drawn(self):
+        one = pixels(wm.render(state([device("A", True, 50)])))
+        two = pixels(wm.render(state([device("A", True, 50), device("B", True, 50)])))
+        self.assertNotEqual(one, two)
+
+    def test_seven_segment_digits_differ(self):
+        import cairo
+        shots = set()
+        for value in [None, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]:
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 16)
+            wm.seven_segment(cairo.Context(surface), 1, 1, 8, 14, value, wm.TEAL, wm.GHOST)
+            shots.add(bytes(surface.get_data()))
+        self.assertEqual(len(shots), 11)
 
     def test_long_name_is_fitted(self):
         import cairo
