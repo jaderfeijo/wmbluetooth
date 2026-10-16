@@ -1,5 +1,7 @@
 # wmbluetooth
 
+> Part of my [Window Maker customisations directory](https://gist.github.com/jaderfeijo/2b1dee6a59f6ef063f0d73f1e117b0af).
+
 A tiny [Window Maker](https://www.windowmaker.org/) dockapp that shows your **connected Bluetooth devices**
 and their battery levels. There was no Bluetooth dockapp in Debian, so this one talks to BlueZ directly over
 D-Bus. It is styled after the stock dark dockapps (`wmbattery`, `wmgtemp`): dark panel, teal seven-segment
