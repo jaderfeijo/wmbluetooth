@@ -1,6 +1,6 @@
 # wmbluetooth
 
-> Part of my [Window Maker customisations directory](https://gist.github.com/jaderfeijo/2b1dee6a59f6ef063f0d73f1e117b0af).
+> Part of [wmodern](https://github.com/jaderfeijo/wmodern), a modern desktop on Window Maker: `wmodern install bluetooth` installs it and keeps it up to date.
 
 A tiny [Window Maker](https://www.windowmaker.org/) dockapp that shows your **connected Bluetooth devices**
 and their battery levels. There was no Bluetooth dockapp in Debian, so this one talks to BlueZ directly over
