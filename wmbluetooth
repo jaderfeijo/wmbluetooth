@@ -92,24 +92,86 @@ def toggle_power():
     bluetoothctl("power", "off" if read_state()["powered"] else "on")
 
 
-def device_menu(state):
-    """rofi list of paired devices; picking one connects or disconnects it. Runs in a thread."""
-    devices = state["devices"]
-    if not devices:
+def rofi_pick(labels, prompt):
+    """Index of the row the user picked in a rofi list, or None."""
+    try:
+        out = subprocess.run(["rofi", "-dmenu", "-i", "-p", prompt, "-format", "i"],
+                             input="\n".join(labels), capture_output=True, text=True, timeout=120).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return int(out) if out.isdigit() and int(out) < len(labels) else None
+
+
+def notify(text):
+    try:
+        subprocess.run(["notify-send", "-a", "wmbluetooth", "Bluetooth", text], timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def scan_for_devices(seconds=8):
+    """Scan briefly and return [(mac, name)] of nearby devices that are not paired yet."""
+    bluetoothctl("--timeout", str(seconds), "scan", "on")
+    try:
+        listed = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True, timeout=10).stdout
+        paired = subprocess.run(["bluetoothctl", "devices", "Paired"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    known = {line.split()[1] for line in paired.splitlines() if line.startswith("Device ")}
+    found = []
+    for line in listed.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0] == "Device" and parts[1] not in known:
+            # unnamed devices show their address as the name; they are rarely what the user is looking for
+            if parts[2].replace("-", ":") != parts[1]:
+                found.append((parts[1], parts[2]))
+    return found
+
+
+def pair_menu():
+    notify("Scanning for devices... put the device in pairing mode.")
+    found = scan_for_devices()
+    if not found:
+        notify("No new devices found. Put the device in pairing mode and try again.")
         return
+    picked = rofi_pick([name for _, name in found], "pair")
+    if picked is None:
+        return
+    mac, name = found[picked]
+    notify(f"Pairing with {name}...")
+    for step in ("pair", "trust", "connect"):
+        result = subprocess.run(["bluetoothctl", step, mac], capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 and step != "connect":
+            notify(f"Could not {step} {name}.")
+            return
+    notify(f"{name} is paired.")
+
+
+def device_menu(state):
+    """rofi list: paired devices (pick one to connect or disconnect), pair a new device, power. Runs in a thread."""
+    devices = state["devices"] if state["available"] else []
     labels = []
     for d in devices:
         extra = ", ".join(x for x in ("connected" if d["connected"] else "",
                                       f"{d['battery']}%" if d["battery"] is not None else "") if x)
         labels.append(("\u25cf " if d["connected"] else "\u25cb ") + d["name"] + (f"  ({extra})" if extra else ""))
-    try:
-        picked = subprocess.run(["rofi", "-dmenu", "-i", "-p", "bluetooth", "-format", "i"],
-                                input="\n".join(labels), capture_output=True, text=True, timeout=120).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+    if not state["available"]:
+        notify("Bluetooth is not available (is bluez running?).")
         return
-    if picked.isdigit() and int(picked) < len(devices):
-        d = devices[int(picked)]
+    labels.append("+ Pair a new device...")
+    labels.append("Turn Bluetooth " + ("off" if state["powered"] else "on"))
+    picked = rofi_pick(labels, "bluetooth")
+    if picked is None:
+        return
+    if picked < len(devices):
+        d = devices[picked]
         bluetoothctl("disconnect" if d["connected"] else "connect", d["mac"])
+    elif picked == len(devices):
+        if not state["powered"]:
+            bluetoothctl("power", "on")
+        pair_menu()
+    else:
+        toggle_power()
 
 
 # -------------------------------------------------------------------- drawing

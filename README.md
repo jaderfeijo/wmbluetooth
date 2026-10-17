@@ -20,7 +20,7 @@ digits with faint unlit segments.
 
 | Action       | Effect                                                              |
 |--------------|---------------------------------------------------------------------|
-| Left click   | Menu (rofi) of your paired devices: pick one to connect or disconnect |
+| Left click   | Menu (rofi): your paired devices (pick one to connect or disconnect), pair a new device, power on or off |
 | Middle click | Switch Bluetooth on or off                                          |
 
 ## Requirements
